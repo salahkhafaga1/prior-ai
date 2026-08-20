@@ -33,6 +33,8 @@ async function parseJsonResponse<T extends object>(res: Response): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
+
 interface ChatApiResponse {
   success?: boolean;
   error?: string;
@@ -188,25 +190,64 @@ Details: ${error.details || 'N/A'}
 
     try {
       console.log('[RAG ENGINE LOG] Dispatching clinical evaluation to /api/chat...');
+      const requestBody = JSON.stringify({
+        message: fullMessageText,
+        payer: activePayerTag.replace('@', ''),
+        images: imagesPayload,
+      });
+
+      const payloadBytes = new TextEncoder().encode(requestBody).length;
+      if (payloadBytes > MAX_PAYLOAD_BYTES) {
+        console.error('[RAG ENGINE LOG] Request payload exceeds platform limit:', payloadBytes);
+        const errorInfo: DiagnosticErrorInfo = {
+          source: '[RAG Pipeline]',
+          errorCode: 'PAYLOAD_TOO_LARGE',
+          message: `Request payload is too large (${(payloadBytes / 1048576).toFixed(1)} MB).`,
+          details:
+            'The hosting platform accepts at most 4.5 MB per request. Attach fewer or smaller images (recompress to JPEG under ~3 MB each) and try again.',
+        };
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `assistant-err-${Date.now()}`,
+            role: 'assistant',
+            content: errorInfo.message,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            errorInfo,
+          },
+        ]);
+        return;
+      }
+
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: fullMessageText,
-          payer: activePayerTag.replace('@', ''),
-          images: imagesPayload,
-        }),
+        body: requestBody,
       });
 
-      const data = await parseJsonResponse<ChatApiResponse>(res);
+      const rawRes = res.clone();
+      let data: ChatApiResponse = {};
+      let parseFailed = false;
+      try {
+        data = await parseJsonResponse<ChatApiResponse>(res);
+      } catch {
+        parseFailed = true;
+        data = {} as ChatApiResponse;
+      }
 
-      if (!res.ok || data.success === false || data.error) {
-        console.error('[RAG ENGINE LOG] API returned error:', data);
+      if (!res.ok || parseFailed || data.success === false || data.error) {
+        let rawBody = '';
+        try {
+          rawBody = (await rawRes.text()).slice(0, 500);
+        } catch {
+          rawBody = '';
+        }
+        console.error('[RAG ENGINE LOG] API returned error:', { status: res.status, data, rawBody });
         const errorInfo: DiagnosticErrorInfo = {
           source: data.source || '[RAG Pipeline]',
           errorCode: data.errorCode || `HTTP_${res.status}`,
-          message: data.message || data.error || 'Evaluation failed.',
-          details: data.details || `Status code ${res.status}`,
+          message: data.message || data.error || `Server returned HTTP ${res.status} with no readable error message.`,
+          details: data.details || `Status code ${res.status}${rawBody ? ` — ${rawBody}` : ''}`,
         };
 
         setMessages((prev) => [

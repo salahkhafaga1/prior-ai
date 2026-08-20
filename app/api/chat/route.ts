@@ -16,6 +16,8 @@ const GEMINI_MODELS = [
   'gemini-2.0-flash',
 ];
 
+const MAX_REQUEST_BODY_BYTES = 4.5 * 1024 * 1024;
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function isCleanText(text: string): boolean {
@@ -143,6 +145,22 @@ export async function POST(req: NextRequest) {
   const startTime = Date.now();
   try {
     logDiagnostic('[RAG ENGINE LOG]', 'Received clinical evaluation request...');
+
+    const rawLength = Number(req.headers.get('content-length') || 0);
+    if (rawLength > MAX_REQUEST_BODY_BYTES) {
+      logDiagnosticError('[RAG ENGINE LOG]', `Request body too large: ${rawLength} bytes.`);
+      return NextResponse.json(
+        {
+          success: false,
+          source: '[RAG Pipeline]',
+          errorCode: 'PAYLOAD_TOO_LARGE',
+          message: 'Request payload exceeds the 4.5 MB hosting platform limit.',
+          details: `Received ${(rawLength / 1048576).toFixed(1)} MB. Attach fewer or smaller images and try again.`,
+        },
+        { status: 413 }
+      );
+    }
+
     const body = await req.json();
     const { message, messages, payer, fileData, images } = body;
 
