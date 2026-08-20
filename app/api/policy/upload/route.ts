@@ -388,10 +388,13 @@ export async function POST(req: NextRequest) {
               // Scanned PDF -> render pages to images + parallel per-page OCR
               logDiagnostic('[UPLOAD LOG]', 'Native and pdfjs extraction found no clean text. Rendering pages for parallel OCR...');
               let pageOcrText = '';
+              let pageRenderError: unknown = null;
+              let pagesRendered = 0;
               try {
                 const pagePipeline = (async () => {
                   const renderStart = Date.now();
                   const pageJpegs = await renderPdfPagesToJpegs(buffer, PDF_PAGE_OCR_LIMIT);
+                  pagesRendered = pageJpegs.length;
                   logDiagnostic(
                     '[UPLOAD LOG]',
                     `Rendered ${pageJpegs.length} page(s) in ${Date.now() - renderStart}ms.`
@@ -407,6 +410,7 @@ export async function POST(req: NextRequest) {
                 })();
                 pageOcrText = await withTimeout(pagePipeline, PDF_PAGE_PIPELINE_TIMEOUT_MS);
               } catch (pageOcrErr: any) {
+                pageRenderError = pageOcrErr;
                 logDiagnosticError('[UPLOAD LOG]', 'PDF page OCR pipeline failed or timed out', pageOcrErr);
               }
 
@@ -421,8 +425,15 @@ export async function POST(req: NextRequest) {
                     success: false,
                     error:
                       '[OCR Engine] Could not extract legible text from this PDF. Please upload the policy as a .txt file or paste the text directly.',
-                    ocrError: pageOcrText.length > 0 ? 'Page OCR text failed cleanliness checks' : 'PDF page OCR produced no text',
+                    ocrError: pageRenderError
+                      ? pageRenderError instanceof Error
+                        ? pageRenderError.message
+                        : String(pageRenderError)
+                      : pageOcrText.length > 0
+                        ? 'Page OCR text failed cleanliness checks'
+                        : 'PDF page OCR produced no text',
                     ocrChars: pageOcrText.length,
+                    pagesRendered,
                   },
                   { status: 422 }
                 );
