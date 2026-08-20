@@ -184,6 +184,17 @@ async function extractPdfTextWithPdfjs(buffer: Buffer): Promise<string> {
 async function renderPdfPagesToJpegs(buffer: Buffer, maxPages: number): Promise<Buffer[]> {
   const { createCanvas } = await import('@napi-rs/canvas');
   const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const path = await import('node:path');
+  if (!pdfjs.GlobalWorkerOptions.workerSrc) {
+    pdfjs.GlobalWorkerOptions.workerSrc = path.join(
+      process.cwd(),
+      'node_modules',
+      'pdfjs-dist',
+      'legacy',
+      'build',
+      'pdf.worker.mjs'
+    );
+  }
   const loadingTask = pdfjs.getDocument({
     data: new Uint8Array(buffer),
     disableFontFace: true,
