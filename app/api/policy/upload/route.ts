@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import zlib from 'zlib';
 import { storePolicyDocument, PolicyDocument, logDiagnostic, logDiagnosticError } from '@/lib/supabase';
-import { runLocalTesseractOCR } from '@/lib/imageProcessing';
+import { runLocalTesseractOCR, extractTextWithGemini } from '@/lib/imageProcessing';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -244,46 +244,77 @@ export async function POST(req: NextRequest) {
             logDiagnostic('[UPLOAD LOG]', `Fast native extraction succeeded (${nativeExtracted.length} clean characters).`);
             content = nativeExtracted;
           } else {
-            // Flat scanned PDF or unindexed image -> Fallback to local Tesseract OCR
-            logDiagnostic('[UPLOAD LOG]', 'Native extraction found flat scanned image. Triggering local Tesseract OCR...');
-            try {
-              const ocrResult = await runLocalTesseractOCR(buffer);
-              if (isCleanReadableText(ocrResult)) {
-                content = ocrResult;
-                ocrUsed = true;
-                logDiagnostic('[UPLOAD LOG]', `Local Tesseract OCR successfully extracted ${ocrResult.length} clean characters.`);
-              } else {
+            // Flat scanned PDF or unindexed image -> Gemini Vision OCR (fast) then local Tesseract as last resort
+            logDiagnostic('[UPLOAD LOG]', 'Native extraction found flat scanned image. Attempting Gemini Vision OCR...');
+            const pdfBase64 = buffer.toString('base64');
+            let geminiText = '';
+            if (file.size <= 15 * 1024 * 1024) {
+              try {
+                geminiText = await extractTextWithGemini({ mimeType: 'application/pdf', base64: pdfBase64 });
+                logDiagnostic('[UPLOAD LOG]', `Gemini Vision OCR extracted ${geminiText.length} characters.`);
+              } catch (geminiErr: any) {
+                logDiagnosticError('[UPLOAD LOG]', 'Gemini Vision OCR failed for PDF', geminiErr);
+              }
+            } else {
+              logDiagnostic('[UPLOAD LOG]', 'PDF exceeds Gemini 15MB limit; skipping Gemini OCR.');
+            }
+
+            if (isCleanReadableText(geminiText)) {
+              content = geminiText;
+              ocrUsed = true;
+            } else {
+              logDiagnostic('[UPLOAD LOG]', 'Gemini OCR insufficient. Falling back to local Tesseract OCR...');
+              try {
+                const ocrResult = await runLocalTesseractOCR(buffer);
+                if (isCleanReadableText(ocrResult)) {
+                  content = ocrResult;
+                  ocrUsed = true;
+                  logDiagnostic('[UPLOAD LOG]', `Local Tesseract OCR successfully extracted ${ocrResult.length} clean characters.`);
+                } else {
+                  return NextResponse.json(
+                    {
+                      success: false,
+                      error:
+                        '[OCR Engine] Could not extract legible text from this scanned PDF. Please ensure the document is clear or upload a .txt version.',
+                    },
+                    { status: 422 }
+                  );
+                }
+              } catch (ocrErr: any) {
+                logDiagnosticError('[UPLOAD LOG]', 'Local Tesseract OCR exception', ocrErr);
                 return NextResponse.json(
                   {
                     success: false,
-                    error:
-                      '[Local OCR Engine] Could not extract legible text from this scanned PDF. Please ensure the document is clear or upload a .txt version.',
+                    error: `[OCR Engine] OCR failed: ${ocrErr?.message || 'Could not process scanned document'}`,
                   },
                   { status: 422 }
                 );
               }
-            } catch (ocrErr: any) {
-              logDiagnosticError('[UPLOAD LOG]', 'Local Tesseract OCR exception', ocrErr);
-              return NextResponse.json(
-                {
-                  success: false,
-                  error: `[Local OCR Engine] OCR failed: ${ocrErr?.message || 'Could not process scanned document'}`,
-                },
-                { status: 422 }
-              );
             }
           }
         } else if (lowerName.endsWith('.png') || lowerName.endsWith('.jpg') || lowerName.endsWith('.jpeg')) {
-          // Direct Image File -> Local Tesseract OCR
-          logDiagnostic('[UPLOAD LOG]', `Image policy uploaded (${lowerName}). Running local Tesseract OCR...`);
+          // Direct Image File -> Gemini Vision OCR first, local Tesseract as fallback
+          logDiagnostic('[UPLOAD LOG]', `Image policy uploaded (${lowerName}). Running Gemini Vision OCR...`);
           try {
-            content = await runLocalTesseractOCR(buffer);
-            ocrUsed = true;
+            const imageBase64 = buffer.toString('base64');
+            if (file.size <= 8 * 1024 * 1024) {
+              try {
+                content = await extractTextWithGemini({ mimeType: file.type || 'image/png', base64: imageBase64 });
+                ocrUsed = true;
+              } catch (geminiErr: any) {
+                logDiagnosticError('[UPLOAD LOG]', 'Gemini Vision OCR failed for image', geminiErr);
+                content = await runLocalTesseractOCR(buffer);
+                ocrUsed = true;
+              }
+            } else {
+              content = await runLocalTesseractOCR(buffer);
+              ocrUsed = true;
+            }
           } catch (ocrErr: any) {
             return NextResponse.json(
               {
                 success: false,
-                error: `[Local OCR Engine] Failed to OCR image: ${ocrErr?.message}`,
+                error: `[OCR Engine] Failed to OCR image: ${ocrErr?.message}`,
               },
               { status: 422 }
             );

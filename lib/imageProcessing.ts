@@ -20,6 +20,10 @@ const OCR_MIN_TEXT_LENGTH = 20;
 // Verified stable Gemini vision-capable model IDs (Google AI docs).
 const CAPTION_MODELS = ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-2.5-flash'];
 
+// Gemini inlineData payload limits (conservative): images 8MB, PDFs 15MB.
+const GEMINI_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+const GEMINI_PDF_MAX_BYTES = 15 * 1024 * 1024;
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const CAPTION_SYSTEM_INSTRUCTION = `You are a medical document image analysis assistant. You analyze an image uploaded to a medical prior-authorization application.
@@ -119,6 +123,70 @@ export async function runLocalTesseractOCR(buffer: Buffer): Promise<string> {
       `Local OCR processing error: ${err instanceof Error ? err.message : 'Please ensure tesseract.js is installed via npm install tesseract.js'}`
     );
   }
+}
+
+const OCR_SYSTEM_INSTRUCTION = `You are a medical document text extraction engine.
+Your ONLY task is to transcribe ALL visible text in the provided document VERBATIM.
+RULES:
+1. Preserve the original reading order and layout as closely as possible.
+2. Include headings, numbers, dates, and table content.
+3. Do NOT summarize, interpret, diagnose, or add commentary.
+4. If the document has no readable text, return the exact string: NO_READABLE_TEXT`;
+
+/**
+ * Extract text from a document (image or PDF) using the Gemini Vision API.
+ * Much faster and more reliable than local Tesseract on serverless functions.
+ * Throws if no text could be extracted or the API key is missing.
+ */
+export async function extractTextWithGemini(input: {
+  mimeType: string;
+  base64: string;
+}): Promise<string> {
+  const apiKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_GENAI_API_KEY ||
+    process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+
+  if (!apiKey || apiKey === 'your_actual_gemini_api_key_here' || apiKey.trim() === '') {
+    throw new Error('GEMINI_API_KEY is not configured.');
+  }
+
+  const ai = new GoogleGenAI({ apiKey });
+  let response: GenerateContentResponse | null = null;
+  let lastError: unknown = null;
+
+  for (const modelName of CAPTION_MODELS) {
+    try {
+      logDiagnostic('[IMAGE LOG]', `Attempting Gemini OCR with model: "${modelName}"...`);
+      response = await ai.models.generateContent({
+        model: modelName,
+        contents: [
+          { inlineData: { mimeType: input.mimeType, data: input.base64 } },
+          { text: 'Transcribe every piece of visible text in this document verbatim.' },
+        ],
+        config: {
+          systemInstruction: OCR_SYSTEM_INSTRUCTION,
+          temperature: 0,
+        },
+      });
+      logDiagnostic('[IMAGE LOG]', `Gemini OCR succeeded with model "${modelName}".`);
+      break;
+    } catch (err) {
+      lastError = err;
+      logDiagnosticError(
+        '[IMAGE LOG]',
+        `Gemini OCR model ${modelName} failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+      await sleep(1000);
+    }
+  }
+
+  const rawText = response?.text?.trim() || '';
+  if (!rawText || rawText === 'NO_READABLE_TEXT') {
+    throw lastError || new Error('Gemini OCR returned no readable text.');
+  }
+
+  return rawText;
 }
 
 function renderCaption(caption: ImageCaption): string {
@@ -249,33 +317,50 @@ export async function processClinicalImage(input: ImageAttachmentRequest): Promi
     return result;
   }
 
-  // A. OCR pipeline (local Tesseract)
-  if (detectedFormat === 'webp') {
-    // Tesseract.js decoding of WebP is unreliable; skip OCR to avoid a worker crash.
-    result.ocrStatus = 'OCR_FAILED';
-    result.error = {
-      phase: 'ocr',
-      message: 'WebP images are not supported by the local OCR engine; image understanding was attempted instead.',
-    };
-  } else {
-    try {
-      const text = await runLocalTesseractOCR(buffer);
-      const trimmed = text.trim();
-      if (trimmed.length >= OCR_MIN_TEXT_LENGTH) {
-        result.ocrText = trimmed;
-        result.ocrStatus = 'OCR_SUCCESS';
-      } else if (trimmed.length > 0) {
-        result.ocrText = trimmed;
-        result.ocrStatus = 'OCR_PARTIAL';
-      } else {
-        result.ocrStatus = 'OCR_FAILED';
-        result.error = { phase: 'ocr', message: 'No readable text detected in image.' };
-      }
-    } catch (err) {
+  // A. OCR pipeline (Gemini Vision first, local Tesseract as fallback)
+  let ocrText = '';
+  let ocrError: unknown = null;
+
+  try {
+    if (input.sizeBytes && input.sizeBytes > GEMINI_IMAGE_MAX_BYTES) {
+      throw new Error(`Image exceeds ${GEMINI_IMAGE_MAX_BYTES / (1024 * 1024)}MB Gemini OCR limit; using local OCR.`);
+    }
+    ocrText = await extractTextWithGemini({ mimeType, base64: input.data });
+  } catch (geminiErr) {
+    ocrError = geminiErr;
+    logDiagnosticError('[IMAGE LOG]', 'Gemini OCR failed; falling back to Tesseract', geminiErr);
+  }
+
+  if (!ocrText.trim()) {
+    if (detectedFormat === 'webp') {
+      // Tesseract.js decoding of WebP is unreliable; skip OCR to avoid a worker crash.
       result.ocrStatus = 'OCR_FAILED';
       result.error = {
         phase: 'ocr',
-        message: err instanceof Error ? err.message : 'OCR failed.',
+        message: ocrError instanceof Error ? ocrError.message : 'WebP images are not supported by the local OCR engine; image understanding was attempted instead.',
+      };
+    } else {
+      try {
+        const text = await runLocalTesseractOCR(buffer);
+        ocrText = text.trim();
+      } catch (err) {
+        ocrError = err;
+      }
+    }
+  }
+
+  if (ocrText.trim().length >= OCR_MIN_TEXT_LENGTH) {
+    result.ocrText = ocrText.trim();
+    result.ocrStatus = 'OCR_SUCCESS';
+  } else if (ocrText.trim().length > 0) {
+    result.ocrText = ocrText.trim();
+    result.ocrStatus = 'OCR_PARTIAL';
+  } else {
+    result.ocrStatus = 'OCR_FAILED';
+    if (!result.error) {
+      result.error = {
+        phase: 'ocr',
+        message: ocrError instanceof Error ? ocrError.message : 'No readable text detected in image.',
       };
     }
   }
