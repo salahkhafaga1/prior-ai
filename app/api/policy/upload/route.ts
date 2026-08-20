@@ -10,6 +10,11 @@ const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50MB limit
 const MAX_CHUNK_LENGTH = 100000; // 100KB per text chunk
 const CHUNK_OVERLAP = 1000;
 const OCR_STAGE_TIMEOUT_MS = 45_000;
+const PDF_PAGE_OCR_LIMIT = 30;
+const PDF_PAGE_RENDER_CONCURRENCY = 4;
+const PDF_PAGE_OCR_CONCURRENCY = 8;
+const PDF_PAGE_OCR_TIMEOUT_MS = 15_000;
+const PDF_PAGE_PIPELINE_TIMEOUT_MS = 50_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -173,6 +178,74 @@ async function extractPdfTextWithPdfjs(buffer: Buffer): Promise<string> {
 }
 
 /**
+ * Render PDF pages to JPEG buffers (server-side) using pdfjs + a WASM/N-API canvas.
+ * Returns an array of page JPEG buffers (up to maxPages).
+ */
+async function renderPdfPagesToJpegs(buffer: Buffer, maxPages: number): Promise<Buffer[]> {
+  const { createCanvas } = await import('@napi-rs/canvas');
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const loadingTask = pdfjs.getDocument({
+    data: new Uint8Array(buffer),
+    disableFontFace: true,
+    useSystemFonts: true,
+  });
+  const doc = await loadingTask.promise;
+  try {
+    const pagesToRender = Math.min(doc.numPages, maxPages);
+    const results: Buffer[] = new Array(pagesToRender);
+    let index = 0;
+    const workers = Array.from({ length: PDF_PAGE_RENDER_CONCURRENCY }, async () => {
+      while (true) {
+        const i = index++;
+        if (i >= pagesToRender) break;
+        const page = await doc.getPage(i + 1);
+        const viewport = page.getViewport({ scale: 1.5 });
+        const canvas = createCanvas(viewport.width, viewport.height);
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, viewport.width, viewport.height);
+        await page.render({
+          canvasContext: ctx as unknown as CanvasRenderingContext2D,
+          canvas: canvas as unknown as HTMLCanvasElement,
+          viewport,
+        }).promise;
+        results[i] = canvas.toBuffer('image/jpeg', 70);
+      }
+    });
+    await Promise.all(workers);
+    return results;
+  } finally {
+    await loadingTask.destroy();
+  }
+}
+
+/**
+ * OCR a set of page JPEG buffers with Gemini in parallel and join the text.
+ */
+async function ocrPdfPagesInParallel(pageJpegs: Buffer[]): Promise<string> {
+  const results: string[] = new Array(pageJpegs.length);
+  let index = 0;
+  const workers = Array.from({ length: PDF_PAGE_OCR_CONCURRENCY }, async () => {
+    while (true) {
+      const i = index++;
+      if (i >= pageJpegs.length) break;
+      try {
+        const text = await withTimeout(
+          extractTextWithGemini({ mimeType: 'image/jpeg', base64: pageJpegs[i].toString('base64') }),
+          PDF_PAGE_OCR_TIMEOUT_MS
+        );
+        results[i] = text;
+      } catch (err) {
+        logDiagnosticError('[UPLOAD LOG]', `OCR failed for page ${i + 1}`, err);
+        results[i] = '';
+      }
+    }
+  });
+  await Promise.all(workers);
+  return results.filter((t) => t && t.trim().length > 0).join('\n\n');
+}
+
+/**
  * Validate that extracted text is legible and contains no raw %PDF stream headers.
  */
 function isCleanReadableText(text: string): boolean {
@@ -312,43 +385,49 @@ export async function POST(req: NextRequest) {
               content = pdfjsText;
               ocrUsed = true;
             } else {
-              // Scanned/unindexed PDF -> Gemini Vision OCR
-              logDiagnostic('[UPLOAD LOG]', 'Native and pdfjs extraction found no clean text. Attempting Gemini Vision OCR...');
-            const pdfBase64 = buffer.toString('base64');
-            let geminiText = '';
-            let ocrError: unknown = null;
-            if (file.size <= 15 * 1024 * 1024) {
+              // Scanned PDF -> render pages to images + parallel per-page OCR
+              logDiagnostic('[UPLOAD LOG]', 'Native and pdfjs extraction found no clean text. Rendering pages for parallel OCR...');
+              let pageOcrText = '';
               try {
-                geminiText = await withTimeout(
-                  extractTextWithGemini({ mimeType: 'application/pdf', base64: pdfBase64 }),
-                  OCR_STAGE_TIMEOUT_MS
-                );
-                logDiagnostic('[UPLOAD LOG]', `Gemini Vision OCR extracted ${geminiText.length} characters.`);
-              } catch (geminiErr: any) {
-                ocrError = geminiErr;
-                logDiagnosticError('[UPLOAD LOG]', 'Gemini Vision OCR failed or timed out for PDF', geminiErr);
+                const pagePipeline = (async () => {
+                  const renderStart = Date.now();
+                  const pageJpegs = await renderPdfPagesToJpegs(buffer, PDF_PAGE_OCR_LIMIT);
+                  logDiagnostic(
+                    '[UPLOAD LOG]',
+                    `Rendered ${pageJpegs.length} page(s) in ${Date.now() - renderStart}ms.`
+                  );
+                  if (pageJpegs.length === 0) return '';
+                  const ocrStart = Date.now();
+                  const text = await ocrPdfPagesInParallel(pageJpegs);
+                  logDiagnostic(
+                    '[UPLOAD LOG]',
+                    `Page OCR produced ${text.length} chars in ${Date.now() - ocrStart}ms.`
+                  );
+                  return text;
+                })();
+                pageOcrText = await withTimeout(pagePipeline, PDF_PAGE_PIPELINE_TIMEOUT_MS);
+              } catch (pageOcrErr: any) {
+                logDiagnosticError('[UPLOAD LOG]', 'PDF page OCR pipeline failed or timed out', pageOcrErr);
               }
-            } else {
-              logDiagnostic('[UPLOAD LOG]', 'PDF exceeds Gemini 15MB limit; skipping Gemini OCR.');
-            }
 
-            if (isCleanReadableText(geminiText)) {
-              content = geminiText;
-              ocrUsed = true;
-            } else {
-              logDiagnostic('[UPLOAD LOG]', `Gemini OCR could not produce clean text for PDF. Raw length: ${geminiText.length}.`);
-              return NextResponse.json(
-                {
-                  success: false,
-                  error:
-                    '[OCR Engine] Could not extract legible text from this PDF. Please upload the policy as a .txt file or paste the text directly.',
-                  ocrError: ocrError instanceof Error ? ocrError.message : 'Gemini OCR returned no clean text',
-                  ocrChars: geminiText.length,
-                },
-                { status: 422 }
-              );
+              if (isCleanReadableText(pageOcrText)) {
+                content = pageOcrText;
+                ocrUsed = true;
+                logDiagnostic('[UPLOAD LOG]', 'Page OCR produced clean policy text.');
+              } else {
+                logDiagnostic('[UPLOAD LOG]', `Page OCR produced insufficient text. Raw length: ${pageOcrText.length}.`);
+                return NextResponse.json(
+                  {
+                    success: false,
+                    error:
+                      '[OCR Engine] Could not extract legible text from this PDF. Please upload the policy as a .txt file or paste the text directly.',
+                    ocrError: pageOcrText.length > 0 ? 'Page OCR text failed cleanliness checks' : 'PDF page OCR produced no text',
+                    ocrChars: pageOcrText.length,
+                  },
+                  { status: 422 }
+                );
+              }
             }
-          }
         }
         } else if (lowerName.endsWith('.png') || lowerName.endsWith('.jpg') || lowerName.endsWith('.jpeg')) {
           // Direct Image File -> Gemini Vision OCR first, local Tesseract as fallback
