@@ -22,6 +22,37 @@ import {
 import { PriorAuthReportData } from '@/components/PriorAuthReportView';
 import { ProcessedImageAttachment, ImageAttachmentRequest } from '@/types/imageProcessing';
 
+async function parseJsonResponse<T extends object>(res: Response): Promise<T> {
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('application/json') && !contentType.includes('text/json')) {
+    const text = (await res.text()).slice(0, 300);
+    throw new Error(
+      `Server returned a non-JSON response (HTTP ${res.status}). ${text || 'This usually means the serverless function timed out or crashed.'}`
+    );
+  }
+  return res.json() as Promise<T>;
+}
+
+interface ChatApiResponse {
+  success?: boolean;
+  error?: string;
+  errorCode?: string;
+  message?: string;
+  details?: string;
+  source?: string;
+  payer?: string;
+  policyTitle?: string;
+  modelUsed?: string;
+  status?: 'APPROVED' | 'ACTION_REQUIRED' | 'REJECTED';
+  matchScore?: number;
+  summary?: string;
+  summaryMessage?: string;
+  checklist?: PriorAuthReportData['checklist'];
+  missingRequirements?: string[];
+  justificationLetter?: string;
+  attachments?: ProcessedImageAttachment[];
+}
+
 export interface DiagnosticErrorInfo {
   source: string;
   errorCode: string;
@@ -79,8 +110,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
       console.log('[SUPABASE LOG] Fetching available payers for tag bar...');
       const res = await fetch('/api/policy/payers');
       if (res.ok) {
-        const data = await res.json();
-        const payers = (data.payers as string[]) || [];
+        const data = await parseJsonResponse<{ payers?: string[] }>(res);
+        const payers = data.payers || [];
         setAvailablePayers(payers);
         if (payers.length > 0 && !activePayerTag) {
           setActivePayerTag(`@${payers[0]}`);
@@ -167,7 +198,7 @@ Details: ${error.details || 'N/A'}
         }),
       });
 
-      const data = await res.json();
+      const data = await parseJsonResponse<ChatApiResponse>(res);
 
       if (!res.ok || data.success === false || data.error) {
         console.error('[RAG ENGINE LOG] API returned error:', data);

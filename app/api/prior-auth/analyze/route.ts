@@ -3,6 +3,9 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { PriorAuthResponse, PriorAuthRequest } from '@/types/priorAuth';
 import { MOCK_CASES, PAYER_OPTIONS } from '@/data/mockCases';
 
+export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
+
 const GEMINI_MODELS = [
   'gemini-3.7-flash',
   'gemini-3.6-flash',

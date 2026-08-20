@@ -20,6 +20,17 @@ import {
 } from 'lucide-react';
 import { PolicyDocument, isSupabaseConfigured } from '@/lib/supabase';
 
+async function parseJsonResponse<T extends object>(res: Response): Promise<T> {
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('application/json') && !contentType.includes('text/json')) {
+    const text = (await res.text()).slice(0, 300);
+    throw new Error(
+      `Server returned a non-JSON response (HTTP ${res.status}). ${text || 'This usually means the serverless function timed out or crashed.'}`
+    );
+  }
+  return res.json() as Promise<T>;
+}
+
 interface PolicySidebarProps {
   isOpen: boolean;
   onClose: () => void;
@@ -134,7 +145,7 @@ export const PolicySidebar: React.FC<PolicySidebarProps> = ({
         body: formData,
       });
 
-      const data = await res.json();
+      const data = await parseJsonResponse<{ success?: boolean; error?: string; message?: string; payer?: string }>(res);
 
       if (!res.ok || data.success === false) {
         console.error('[UPLOAD LOG] Upload rejected:', data);

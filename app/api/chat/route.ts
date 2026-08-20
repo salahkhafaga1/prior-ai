@@ -4,6 +4,9 @@ import { searchPayerPolicies, fetchAvailablePayers, PolicyDocument, logDiagnosti
 import { processClinicalImage, MAX_IMAGES_PER_REQUEST } from '@/lib/imageProcessing';
 import { ImageAttachmentRequest, ProcessedImageAttachment } from '@/types/imageProcessing';
 
+export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
+
 // Active Google AI Studio model sequence
 const GEMINI_MODELS = [
   'gemini-3.7-flash',
