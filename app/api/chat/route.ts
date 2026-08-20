@@ -3,6 +3,8 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { searchPayerPolicies, fetchAvailablePayers, PolicyDocument, logDiagnostic, logDiagnosticError } from '@/lib/supabase';
 import { processClinicalImage, MAX_IMAGES_PER_REQUEST } from '@/lib/imageProcessing';
 import { ImageAttachmentRequest, ProcessedImageAttachment } from '@/types/imageProcessing';
+import { isArabicText, resolveResponseLanguage } from '@/lib/language';
+import { Language } from '@/lib/i18n/translations';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -66,7 +68,75 @@ STRICT GROUNDING & VERIFICATION RULES:
 ATTACHED IMAGES RULES:
 6. OCR text extracted from an attached image is extracted document text and may be imperfect.
 7. Image descriptions are AI-generated visual context ONLY. They are NOT authoritative medical evidence, measurements, verbatim records, or diagnoses.
-8. Never use image descriptions for policy citations. Policy citations must come EXCLUSIVELY from the retrieved policy documents.`;
+8. Never use image descriptions for policy citations. Policy citations must come EXCLUSIVELY from the retrieved policy documents.
+
+LANGUAGE & BILINGUAL RULES:
+9. Respond in the SAME language as the user's latest message, or the explicitly requested language (RESPONSE_LANGUAGE in the prompt). Never auto-switch mid-answer.
+10. If RESPONSE_LANGUAGE is 'ar': write all free-text fields (summary, requirement, patientEvidence, missingRequirements, justificationLetter) in Modern Standard Arabic, but KEEP the following in their ORIGINAL stored language (English): exactPolicyQuote, sectionClause, payer, policy title, CPT codes, policy numbers, procedure names, and medical abbreviations. Do not translate or paraphrase policy quotes.
+11. If RESPONSE_LANGUAGE is 'en': write everything in English as before.
+12. POLICY EVIDENCE RULE: Evidence must come ONLY from the retrieved policy content. Never fabricate coverage rules or medical guidelines.
+13. CITATION RULE: Citations must reference the ORIGINAL policy source exactly as stored (payer name, policy title, clause/section, verbatim quote). Do NOT create translated or fabricated citations. Never cite the LLM, the image description, or clinical notes as policy evidence.
+14. CLINICAL CONTEXT RULE: Patient-provided information may be Arabic, English, or mixed. Interpret all of it correctly without requiring the user to translate it. OCR output may be Arabic, English, or mixed; use it as-is.
+15. IMAGE DESCRIPTION RULE: Image descriptions are descriptive context ONLY. Never treat them as authoritative medical measurements or policy evidence.
+16. MEDICAL TERMINOLOGY RULE: For Arabic responses use standard Arabic medical terminology. For important terms, use "Arabic term (English term)", e.g. الاستئصال بالترددات الراديوية (Radiofrequency Ablation). Never alter the underlying policy meaning.
+17. ARABIC REPORT RULE: When the user asks for a Prior Authorization report in Arabic, use headings such as: التقييم الطبي، معايير السياسة، المعلومات المدعومة، المعلومات الناقصة، المعلومات غير المستوفاة، الأدلة من السياسة، التوصية. Preserve CPT codes, policy numbers, procedure names, and citation references unchanged.`;
+
+const RETRIEVAL_TRANSLATION_MODELS = [
+  'gemini-3.6-flash',
+  'gemini-3.5-flash',
+  'gemini-2.5-flash',
+];
+
+/**
+ * Lightweight Arabic -> English query translator used ONLY as a retrieval
+ * fallback (payer detection). The original Arabic query remains the reasoning
+ * prompt and is never stored or translated permanently.
+ */
+async function translateQueryForRetrieval(
+  userPrompt: string,
+  availablePayers: string[]
+): Promise<{ payer: string; englishQuery: string }> {
+  const apiKey =
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_GENAI_API_KEY ||
+    process.env.NEXT_PUBLIC_GEMINI_API_KEY;
+
+  if (!apiKey) return { payer: '', englishQuery: userPrompt };
+
+  const ai = new GoogleGenAI({ apiKey });
+  const instruction = `You are a medical prior-authorization retrieval assistant. The user wrote a clinical query, possibly in Arabic.
+Identify the target insurance payer from the provided list (if mentioned), and translate the clinical query to English for RETRIEVAL ONLY.
+Available payers: ${availablePayers.join(', ')}
+Return JSON with exactly two fields:
+{"payer": "exact payer id from the list that matches, or empty string if none is mentioned", "englishQuery": "faithful English translation of the clinical query, keeping medical terminology standard"}
+Do not translate or modify any policy document text. If the query is already English, return it unchanged.`;
+
+  let lastError: unknown = null;
+  for (const modelName of RETRIEVAL_TRANSLATION_MODELS) {
+    try {
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: userPrompt,
+        config: {
+          systemInstruction: instruction,
+          temperature: 0.1,
+          responseMimeType: 'application/json',
+        },
+      });
+      const parsed = JSON.parse(response?.text || '{}');
+      return {
+        payer: String(parsed.payer || '').trim(),
+        englishQuery: String(parsed.englishQuery || userPrompt),
+      };
+    } catch (err: any) {
+      lastError = err;
+      logDiagnosticError('[GEMINI API LOG]', `Retrieval translation model ${modelName} failed`, err);
+      await sleep(800);
+    }
+  }
+  logDiagnosticError('[GEMINI API LOG]', 'All retrieval translation models failed', lastError);
+  return { payer: '', englishQuery: userPrompt };
+}
 
 const STRICT_JSON_SCHEMA = {
   type: Type.OBJECT,
@@ -162,10 +232,13 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { message, messages, payer, fileData, images } = body;
+    const { message, messages, payer, fileData, images, language } = body;
 
     const userPrompt =
       message || (messages && messages[messages.length - 1]?.content) || '';
+
+    const effectiveLanguage: Language = resolveResponseLanguage(language, userPrompt);
+    logDiagnostic('[RAG ENGINE LOG]', `Response language resolved: "${effectiveLanguage}" (explicit: ${language || 'none'}).`);
 
     const rawImages: ImageAttachmentRequest[] = Array.isArray(images) ? images : [];
 
@@ -241,7 +314,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 4. Detect Target Payer Tag
+    // 4. Detect Target Payer Tag (with Arabic cross-language retrieval fallback)
     let detectedPayer = payer || '';
     const tagMatch = userPrompt.match(/@([a-zA-Z0-9_\-]+)/);
 
@@ -251,7 +324,38 @@ export async function POST(req: NextRequest) {
       const foundInText = availablePayers.find((p) =>
         userPrompt.toLowerCase().includes(p.toLowerCase())
       );
-      detectedPayer = foundInText || availablePayers[0];
+      if (foundInText) {
+        detectedPayer = foundInText;
+      } else if (isArabicText(userPrompt)) {
+        // Arabic query: no @tag and no Latin payer string matched.
+        // Translate ONLY for retrieval (payer identification); keep the original Arabic prompt.
+        logDiagnostic(
+          '[RAG ENGINE LOG]',
+          'Arabic query detected with no explicit payer tag. Running lightweight retrieval translation fallback...'
+        );
+        const translated = await translateQueryForRetrieval(userPrompt, availablePayers);
+        const foundInTranslation =
+          availablePayers.find((p) =>
+            translated.englishQuery.toLowerCase().includes(p.toLowerCase())
+          ) || translated.payer;
+        if (foundInTranslation) {
+          detectedPayer = foundInTranslation;
+          logDiagnostic(
+            '[RAG ENGINE LOG]',
+            `Cross-language retrieval fallback identified payer "${detectedPayer}" from translated Arabic query.`
+          );
+        } else {
+          logDiagnostic(
+            '[RAG ENGINE LOG]',
+            'Arabic retrieval translation found no explicit payer; falling back to first available payer.'
+          );
+          detectedPayer = availablePayers[0];
+        }
+      } else {
+        detectedPayer = availablePayers[0];
+      }
+    } else if (!detectedPayer && availablePayers.length > 0) {
+      detectedPayer = availablePayers[0];
     }
 
     logDiagnostic('[RAG ENGINE LOG]', `Target payer detected: "${detectedPayer}"`);
@@ -355,7 +459,9 @@ export async function POST(req: NextRequest) {
     const imgStart = Date.now();
     if (imagesToProcess.length > 0) {
       const processed = await Promise.all(
-        imagesToProcess.map((img) => processClinicalImage(img, { skipLocalFallback: true }))
+        imagesToProcess.map((img) =>
+          processClinicalImage(img, { skipLocalFallback: true, language: effectiveLanguage })
+        )
       );
       attachments.push(...processed);
       logDiagnostic(
@@ -412,11 +518,13 @@ ${userPrompt}
 """
 ${attachmentContext}
 TARGET INSURANCE PAYER: ${detectedPayer}
+RESPONSE_LANGUAGE: ${effectiveLanguage}
 
 RETRIEVED INSURANCE POLICY GROUND TRUTH (SUPABASE DATABASE):
 ${policyContext}
 
-Evaluate this clinical encounter against the retrieved insurance policy criteria.`;
+Evaluate this clinical encounter against the retrieved insurance policy criteria.
+Respond in RESPONSE_LANGUAGE. Policy evidence and citations MUST come only from the retrieved policy text, in its original language.`;
 
     let responseText: string | null = null;
     let successfulModel = '';
@@ -498,6 +606,7 @@ Evaluate this clinical encounter against the retrieved insurance policy criteria
       payer: detectedPayer,
       policyTitle: validDocs[0]?.title || `${detectedPayer} Policy`,
       modelUsed: successfulModel,
+      responseLanguage: effectiveLanguage,
       attachments,
       ...parsedData,
     });

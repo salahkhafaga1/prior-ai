@@ -5,6 +5,7 @@ import {
   ProcessedImageAttachment,
 } from '@/types/imageProcessing';
 import { logDiagnostic, logDiagnosticError } from '@/lib/supabase';
+import { Language } from '@/lib/i18n/translations';
 
 export const SUPPORTED_IMAGE_MIME_TYPES = new Set([
   'image/png',
@@ -36,6 +37,8 @@ STRICT RULES:
 5. Keep the description concise and clinically useful (2-5 sentences).
 6. Do not generate policy citations, coverage determinations, or authorization verdicts.
 7. Set "confidence" to "low", "medium", or "high" indicating how certain you are about what the image type is.
+8. Write "description" and "visibleTextSummary" in the requested language (RESPONSE_LANGUAGE). If it is 'ar', write them in Arabic while keeping any visible codes, numbers, medication names, and technical identifiers in their original form. If it is 'en', write them in English.
+9. These descriptions are descriptive context only. They are NEVER authoritative medical or policy evidence.
 
 Return JSON with fields: imageType, description, visibleTextSummary, confidence.`;
 
@@ -49,11 +52,11 @@ const CAPTION_JSON_SCHEMA = {
     },
     description: {
       type: Type.STRING,
-      description: 'Concise visual interpretation of what is visible in the image',
+      description: 'Concise visual interpretation of what is visible in the image (in RESPONSE_LANGUAGE)',
     },
     visibleTextSummary: {
       type: Type.STRING,
-      description: 'Summary of text actually visible in the image',
+      description: 'Summary of text actually visible in the image (in RESPONSE_LANGUAGE)',
     },
     confidence: {
       type: Type.STRING,
@@ -104,12 +107,29 @@ function detectImageFormat(buffer: Buffer): 'png' | 'jpeg' | 'webp' | null {
 /**
  * Run local Tesseract.js OCR on an image/document buffer.
  * 100% local, zero external API costs. Shared by the policy upload and chat pipelines.
+ * Uses the multilingual language pack (English + Arabic) when available and falls
+ * back to English-only if the Arabic traineddata cannot be loaded.
  */
-export async function runLocalTesseractOCR(buffer: Buffer): Promise<string> {
-  logDiagnostic('[IMAGE LOG]', 'Initiating local Tesseract OCR engine on image buffer...');
+export async function runLocalTesseractOCR(
+  buffer: Buffer,
+  langs: string[] = ['eng', 'ara']
+): Promise<string> {
+  logDiagnostic('[IMAGE LOG]', `Initiating local Tesseract OCR engine on image buffer (langs: ${langs.join('+')})...`);
   try {
     const { createWorker } = await import('tesseract.js');
-    const worker = await createWorker('eng');
+    let worker;
+    try {
+      worker = await createWorker(langs);
+    } catch (langErr) {
+      const langErrorMessage =
+        langErr instanceof Error ? langErr.message : String(langErr);
+      logDiagnosticError(
+        '[IMAGE LOG]',
+        `Tesseract failed to load language pack ${langs.join('+')}; falling back to 'eng'. ${langErrorMessage}`,
+        langErr
+      );
+      worker = await createWorker('eng');
+    }
 
     const ret = await worker.recognize(buffer);
     await worker.terminate();
@@ -129,9 +149,10 @@ const OCR_SYSTEM_INSTRUCTION = `You are a medical document text extraction engin
 Your ONLY task is to transcribe ALL visible text in the provided document VERBATIM.
 RULES:
 1. Preserve the original reading order and layout as closely as possible.
-2. Include headings, numbers, dates, and table content.
-3. Do NOT summarize, interpret, diagnose, or add commentary.
-4. If the document has no readable text, return the exact string: NO_READABLE_TEXT`;
+2. The document may be in English, Arabic, or a mixed Arabic/English clinical document. Transcribe every piece of text in its ORIGINAL language. Do not translate, transliterate, or summarize any text.
+3. Include headings, numbers, dates, and table content.
+4. Do NOT summarize, interpret, diagnose, or add commentary.
+5. If the document has no readable text, return the exact string: NO_READABLE_TEXT`;
 
 /**
  * Extract text from a document (image or PDF) using the Gemini Vision API.
@@ -162,7 +183,7 @@ export async function extractTextWithGemini(input: {
         model: modelName,
         contents: [
           { inlineData: { mimeType: input.mimeType, data: input.base64 } },
-          { text: 'Transcribe every piece of visible text in this document verbatim.' },
+          { text: 'Transcribe every piece of visible text in this document verbatim, preserving its original language (English, Arabic, or mixed).' },
         ],
         config: {
           systemInstruction: OCR_SYSTEM_INSTRUCTION,
@@ -202,10 +223,13 @@ function renderCaption(caption: ImageCaption): string {
  * Generate a concise image understanding / caption using the existing Gemini integration.
  * Descriptive context only; never treated as authoritative medical evidence.
  */
-export async function generateImageCaption(input: {
-  mimeType: string;
-  base64: string;
-}): Promise<ImageCaption> {
+export async function generateImageCaption(
+  input: {
+    mimeType: string;
+    base64: string;
+  },
+  language: Language = 'en'
+): Promise<ImageCaption> {
   const apiKey =
     process.env.GEMINI_API_KEY ||
     process.env.GOOGLE_GENAI_API_KEY ||
@@ -219,6 +243,8 @@ export async function generateImageCaption(input: {
   let response: GenerateContentResponse | null = null;
   let lastError: unknown = null;
 
+  const captionInstruction = `${CAPTION_SYSTEM_INSTRUCTION}\nRESPONSE_LANGUAGE: ${language}`;
+
   for (const modelName of CAPTION_MODELS) {
     try {
       logDiagnostic('[IMAGE LOG]', `Attempting image understanding with model: "${modelName}"...`);
@@ -229,7 +255,7 @@ export async function generateImageCaption(input: {
           { text: 'Analyze this medical-related image and return the requested JSON.' },
         ],
         config: {
-          systemInstruction: CAPTION_SYSTEM_INSTRUCTION,
+          systemInstruction: captionInstruction,
           temperature: 0.2,
           responseMimeType: 'application/json',
           responseSchema: CAPTION_JSON_SCHEMA,
@@ -267,9 +293,10 @@ export async function generateImageCaption(input: {
  */
 export async function processClinicalImage(
   input: ImageAttachmentRequest,
-  options?: { skipLocalFallback?: boolean }
+  options?: { skipLocalFallback?: boolean; language?: Language }
 ): Promise<ProcessedImageAttachment> {
   const skipLocalFallback = options?.skipLocalFallback ?? false;
+  const language = options?.language ?? 'en';
   const mimeType = normalizeImageMimeType(input.mimeType);
   const fileName = input.fileName || 'image';
 
@@ -347,7 +374,7 @@ export async function processClinicalImage(
 
   const runCaptionStage = async (): Promise<{ caption: ImageCaption | null; error: unknown }> => {
     try {
-      const caption = await generateImageCaption({ mimeType, base64: input.data });
+      const caption = await generateImageCaption({ mimeType, base64: input.data }, language);
       return { caption, error: null };
     } catch (captionErr) {
       return { caption: null, error: captionErr };

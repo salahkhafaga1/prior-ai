@@ -17,6 +17,19 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Arabic (RTL) rendering: use system Arabic typefaces as the primary family. */
+html[dir="rtl"] body {
+  font-family: "Segoe UI", "Cairo", "Noto Kufi Arabic", "Noto Naskh Arabic",
+    "Amiri", "Tajawal", var(--font-sans), -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+}
+
+/* Technical identifiers, codes, filenames and quotes stay LTR even in Arabic UI.
+   Apply the `ltr-isolate` class to specific tokens; it is opt-in, not blanket. */
+.ltr-isolate {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
 /* Focus & Scrollbars */
 input:focus, textarea:focus, select:focus, button:focus {
   outline: none;

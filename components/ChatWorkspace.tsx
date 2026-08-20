@@ -18,9 +18,11 @@ import {
   Terminal,
   ChevronDown,
   ChevronUp,
+  Languages,
 } from 'lucide-react';
 import { PriorAuthReportData } from '@/components/PriorAuthReportView';
 import { ProcessedImageAttachment, ImageAttachmentRequest } from '@/types/imageProcessing';
+import { useLanguage } from '@/lib/i18n/LanguageContext';
 
 async function parseJsonResponse<T extends object>(res: Response): Promise<T> {
   const contentType = res.headers.get('content-type') || '';
@@ -45,6 +47,7 @@ interface ChatApiResponse {
   payer?: string;
   policyTitle?: string;
   modelUsed?: string;
+  responseLanguage?: string;
   status?: 'APPROVED' | 'ACTION_REQUIRED' | 'REJECTED';
   matchScore?: number;
   summary?: string;
@@ -96,6 +99,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   setActivePayerTag,
   payersRefreshKey,
 }) => {
+  const { language, t, translateServerError, toggleLanguage } = useLanguage();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputPrompt, setInputPrompt] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -175,8 +179,8 @@ Details: ${error.details || 'N/A'}
       content:
         textToSend ||
         (attachedImages.length > 0
-          ? `Uploaded image(s): ${attachedImages.map((i) => i.name).join(', ')}`
-          : `Uploaded chart record: ${attachedFile?.name}`),
+          ? `${t('uploadedImages')} ${attachedImages.map((i) => i.name).join(', ')}`
+          : `${t('uploadedChart')} ${attachedFile?.name}`),
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       attachmentName: attachedFile?.name,
       imageAttachments: attachedImages,
@@ -194,6 +198,7 @@ Details: ${error.details || 'N/A'}
         message: fullMessageText,
         payer: activePayerTag.replace('@', ''),
         images: imagesPayload,
+        language,
       });
 
       const payloadBytes = new TextEncoder().encode(requestBody).length;
@@ -202,9 +207,8 @@ Details: ${error.details || 'N/A'}
         const errorInfo: DiagnosticErrorInfo = {
           source: '[RAG Pipeline]',
           errorCode: 'PAYLOAD_TOO_LARGE',
-          message: `Request payload is too large (${(payloadBytes / 1048576).toFixed(1)} MB).`,
-          details:
-            'The hosting platform accepts at most 4.5 MB per request. Attach fewer or smaller images (recompress to JPEG under ~3 MB each) and try again.',
+          message: t('errPayloadTooLarge'),
+          details: `Status code: ${(payloadBytes / 1048576).toFixed(1)} MB sent.`,
         };
         setMessages((prev) => [
           ...prev,
@@ -243,10 +247,11 @@ Details: ${error.details || 'N/A'}
           rawBody = '';
         }
         console.error('[RAG ENGINE LOG] API returned error:', { status: res.status, data, rawBody });
+        const serverMessage = data.message || data.error || `Server returned HTTP ${res.status} with no readable error message.`;
         const errorInfo: DiagnosticErrorInfo = {
           source: data.source || '[RAG Pipeline]',
           errorCode: data.errorCode || `HTTP_${res.status}`,
-          message: data.message || data.error || `Server returned HTTP ${res.status} with no readable error message.`,
+          message: translateServerError(data.errorCode, serverMessage),
           details: data.details || `Status code ${res.status}${rawBody ? ` — ${rawBody}` : ''}`,
         };
 
@@ -264,7 +269,7 @@ Details: ${error.details || 'N/A'}
       }
 
       console.log('[RAG ENGINE LOG] Received evaluation result:', data);
-      const summaryText = data.summary || data.summaryMessage || 'Prior Authorization analysis complete.';
+      const summaryText = data.summary || data.summaryMessage || t('errDefault');
 
       const reportData: PriorAuthReportData = {
         status: data.status || 'ACTION_REQUIRED',
@@ -292,7 +297,7 @@ Details: ${error.details || 'N/A'}
       const errorInfo: DiagnosticErrorInfo = {
         source: '[RAG Pipeline]',
         errorCode: 'NETWORK_EXCEPTION',
-        message: 'Failed to connect to Prior Authorization API route.',
+        message: t('errDefault'),
         details: err?.message || String(err),
       };
 
@@ -363,7 +368,7 @@ Details: ${error.details || 'N/A'}
           </div>
           <div>
             <h1 className="text-xs font-bold uppercase tracking-wider text-slate-900">
-              PriorAuth Copilot <span className="text-slate-400 font-normal">/ Production RAG</span>
+              {t('appTitle')} <span className="text-slate-400 font-normal">{t('prodRagTag')}</span>
             </h1>
           </div>
         </div>
@@ -371,13 +376,22 @@ Details: ${error.details || 'N/A'}
         <div className="flex items-center gap-2">
           <button
             type="button"
+            onClick={toggleLanguage}
+            className="px-2.5 py-1.5 rounded text-[11px] font-bold border border-slate-300 hover:bg-slate-50 text-slate-700 flex items-center gap-1.5 transition-colors cursor-pointer"
+            title="Switch UI language"
+          >
+            <Languages className="w-3.5 h-3.5" />
+            <span dir="ltr" className="tracking-wide">{t('langSwitch')}</span>
+          </button>
+          <button
+            type="button"
             onClick={onOpenPolicyLibrary}
             className="px-3 py-1.5 rounded text-xs font-semibold border border-slate-300 hover:bg-slate-50 text-slate-700 flex items-center gap-1.5 transition-colors cursor-pointer"
           >
             <BookOpen className="w-3.5 h-3.5" />
-            <span>Insurance Policy Library</span>
+            <span>{t('openPolicyLibrary')}</span>
             {availablePayers.length > 0 && (
-              <span className="ml-1 px-1.5 py-0.2 bg-slate-900 text-white rounded-full text-[10px]">
+              <span className="ms-1 px-1.5 py-0.2 bg-slate-900 text-white rounded-full text-[10px]">
                 {availablePayers.length}
               </span>
             )}
@@ -396,22 +410,22 @@ Details: ${error.details || 'N/A'}
 
             <div className="space-y-2">
               <h2 className="text-base font-bold text-slate-900 tracking-tight">
-                Production Medical Prior Authorization Workspace
+                {t('emptyTitle')}
               </h2>
               <p className="text-xs text-slate-500 max-w-md mx-auto leading-relaxed">
-                Paste patient encounter records and mention a target payer with <span className="font-bold text-slate-700">@PayerName</span> to evaluate medical necessity against real policy documents.
+                {t('emptyDescription')}
               </p>
             </div>
 
             {availablePayers.length === 0 ? (
               /* No Policies Warning Banner */
-              <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg text-left max-w-md mx-auto space-y-2">
+              <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg text-start max-w-md mx-auto space-y-2">
                 <div className="flex items-center gap-2 text-amber-900 font-bold text-xs">
                   <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                  <span>No Insurance Policies Uploaded Yet</span>
+                  <span>{t('noPoliciesTitle')}</span>
                 </div>
                 <p className="text-[11px] text-amber-800 leading-relaxed">
-                  To perform zero-hallucination policy evaluations, please click below to upload your first insurance policy document into the database.
+                  {t('noPoliciesDesc')}
                 </p>
                 <button
                   type="button"
@@ -419,14 +433,14 @@ Details: ${error.details || 'N/A'}
                   className="px-3 py-1.5 bg-amber-700 hover:bg-amber-800 text-white text-xs font-bold rounded flex items-center gap-1.5 transition-colors cursor-pointer"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  <span>Upload Insurance Policy PDF</span>
+                  <span>{t('uploadPolicyBtn')}</span>
                 </button>
               </div>
             ) : (
               /* Instructions with Available Payers */
-              <div className="p-4 bg-white border border-slate-200 rounded-lg text-left max-w-md mx-auto space-y-2 shadow-sm">
+              <div className="p-4 bg-white border border-slate-200 rounded-lg text-start max-w-md mx-auto space-y-2 shadow-sm">
                 <div className="text-xs font-bold text-slate-800 uppercase tracking-wider">
-                  Active Database Grounded Payers:
+                  {t('activePayersTitle')}
                 </div>
                 <div className="flex flex-wrap gap-1.5 pt-1">
                   {availablePayers.map((p) => (
@@ -436,12 +450,12 @@ Details: ${error.details || 'N/A'}
                       onClick={() => handleInsertTag(`@${p}`)}
                       className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-800 rounded text-xs font-semibold cursor-pointer"
                     >
-                      @{p}
+                      <span dir="ltr">@{p}</span>
                     </button>
                   ))}
                 </div>
                 <p className="text-[11px] text-slate-400 pt-1">
-                  Click a payer tag above or type your clinical prompt with @PayerName to begin.
+                  {t('payersHint')}
                 </p>
               </div>
             )}
@@ -458,17 +472,17 @@ Details: ${error.details || 'N/A'}
               >
                 {/* Message Header */}
                 <div className="text-[10px] uppercase font-bold text-slate-400 mb-1 px-1">
-                  {m.role === 'user' ? 'Physician' : 'PriorAuth Verification Engine'} • {m.timestamp}
+                  {m.role === 'user' ? t('physician') : t('engine')} • {m.timestamp}
                 </div>
 
                 {/* Message Card */}
                 {m.role === 'user' ? (
-                  <div className="bg-slate-900 text-white rounded-lg p-4 text-xs font-mono max-w-2xl leading-relaxed whitespace-pre-wrap shadow-sm">
+                  <div className="bg-slate-900 text-white rounded-lg p-4 text-xs max-w-2xl leading-relaxed whitespace-pre-wrap shadow-sm" dir="auto">
                     {m.content}
                     {m.attachmentName && (
                       <div className="mt-2 pt-2 border-t border-slate-700 text-[11px] text-slate-300 flex items-center gap-1.5">
                         <Paperclip className="w-3 h-3" />
-                        <span>Attached Record: {m.attachmentName}</span>
+                        <span>{t('attachedRecord')} <span dir="ltr">{m.attachmentName}</span></span>
                       </div>
                     )}
                     {m.imageAttachments && m.imageAttachments.length > 0 && (
@@ -490,10 +504,10 @@ Details: ${error.details || 'N/A'}
                     <div className="flex items-center justify-between border-b border-rose-200 pb-2.5">
                       <div className="flex items-center gap-2">
                         <span className="px-2 py-0.5 bg-rose-200 text-rose-900 font-mono font-bold text-[10px] rounded">
-                          {m.errorInfo.source}
+                          <span dir="ltr">{m.errorInfo.source}</span>
                         </span>
                         <span className="font-mono font-extrabold text-[11px] text-rose-700">
-                          {m.errorInfo.errorCode}
+                          <span dir="ltr">{m.errorInfo.errorCode}</span>
                         </span>
                       </div>
 
@@ -506,12 +520,12 @@ Details: ${error.details || 'N/A'}
                         {copiedLogId === m.id ? (
                           <>
                             <Check className="w-3 h-3 text-emerald-600" />
-                            <span>Log Copied!</span>
+                            <span>{t('logCopied')}</span>
                           </>
                         ) : (
                           <>
                             <Copy className="w-3 h-3" />
-                            <span>Copy Error Log</span>
+                            <span>{t('copyLog')}</span>
                           </>
                         )}
                       </button>
@@ -529,7 +543,7 @@ Details: ${error.details || 'N/A'}
                           className="text-[10px] font-bold text-rose-700 hover:text-rose-900 flex items-center gap-1 cursor-pointer"
                         >
                           <Terminal className="w-3 h-3" />
-                          <span>{expandedDetails[m.id] ? 'Hide Technical Details' : 'Show Technical Details'}</span>
+                          <span>{expandedDetails[m.id] ? t('hideTechDetails') : t('showTechDetails')}</span>
                           {expandedDetails[m.id] ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                         </button>
 
@@ -550,7 +564,7 @@ Details: ${error.details || 'N/A'}
                           className="px-3 py-1.5 bg-rose-700 hover:bg-rose-800 text-white rounded text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow-sm"
                         >
                           <UploadCloud className="w-3.5 h-3.5" />
-                          <span>Open Insurance Policy Library</span>
+                          <span>{t('openPolicyLibraryShort')}</span>
                         </button>
                       </div>
                     )}
@@ -575,18 +589,18 @@ Details: ${error.details || 'N/A'}
                           )}
                           <span className="font-bold uppercase tracking-wider text-xs">
                             {m.reportData.status === 'APPROVED'
-                              ? `Coverage Approved (${m.reportData.matchScore}% Match)`
-                              : `Action Required (${m.reportData.matchScore}% Criteria Met)`}
+                              ? t('coverageApproved', { n: m.reportData.matchScore })
+                              : t('actionRequired', { n: m.reportData.matchScore })}
                           </span>
                         </div>
                         <span className="font-mono text-[10px] bg-black/10 px-2 py-0.5 rounded font-bold">
-                          {m.reportData.payer}
+                          <span dir="ltr">{m.reportData.payer}</span>
                         </span>
                       </div>
                     )}
 
                     {/* Summary Message */}
-                    <div className="leading-relaxed text-slate-700 font-medium">
+                    <div className="leading-relaxed text-slate-700 font-medium" dir="auto">
                       {m.content}
                     </div>
 
@@ -594,9 +608,9 @@ Details: ${error.details || 'N/A'}
                     {m.reportData?.missingRequirements && m.reportData.missingRequirements.length > 0 && (
                       <div className="p-3 bg-amber-50/70 border border-amber-200 rounded text-amber-900 space-y-1">
                         <div className="font-bold text-[11px] uppercase">
-                          Documentation Gaps to Resolve:
+                          {t('documentationGaps')}
                         </div>
-                        <ul className="list-disc list-inside text-xs space-y-0.5">
+                        <ul className="list-disc list-inside text-xs space-y-0.5" dir="auto">
                           {m.reportData.missingRequirements.map((gap, i) => (
                             <li key={i}>{gap}</li>
                           ))}
@@ -608,7 +622,7 @@ Details: ${error.details || 'N/A'}
                     {m.reportData?.checklist && m.reportData.checklist.length > 0 && (
                       <div className="space-y-2 border-t border-slate-100 pt-3">
                         <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                          Policy Criteria Verification & Citations:
+                          {t('criteriaCitations')}
                         </div>
                         <div className="space-y-2">
                           {m.reportData.checklist.map((c, i) => (
@@ -617,7 +631,7 @@ Details: ${error.details || 'N/A'}
                               className="p-3 rounded bg-slate-50 border border-slate-200 text-xs space-y-1.5"
                             >
                               <div className="flex items-center justify-between">
-                                <span className="font-bold text-slate-900">
+                                <span className="font-bold text-slate-900" dir="auto">
                                   {c.requirement}
                                 </span>
                                 <span
@@ -627,21 +641,21 @@ Details: ${error.details || 'N/A'}
                                       : 'bg-amber-100 text-amber-900'
                                   }`}
                                 >
-                                  {c.met ? 'Satisfied' : 'Missing'}
+                                  {c.met ? t('satisfied') : t('missing')}
                                 </span>
                               </div>
 
                               <div className="text-[11px] text-slate-600 bg-white p-2 rounded border border-slate-100 space-y-1">
                                 <div className="font-semibold text-slate-700">
-                                  Clause: <span className="font-mono text-slate-900">{c.sectionClause}</span>
+                                  {t('clause')} <span className="font-mono text-slate-900" dir="ltr">{c.sectionClause}</span>
                                 </div>
-                                <div className="italic font-serif text-slate-600">
+                                <div className="italic font-serif text-slate-600" dir="ltr">
                                   &ldquo;{c.exactPolicyQuote}&rdquo;
                                 </div>
                               </div>
 
-                              <div className="text-[11px] text-slate-700 pl-1 font-mono">
-                                <span className="font-bold text-slate-500">Chart Evidence:</span> {c.patientEvidence}
+                              <div className="text-[11px] text-slate-700 ps-1" dir="auto">
+                                <span className="font-bold text-slate-500">{t('chartEvidence')}</span> {c.patientEvidence}
                               </div>
                             </div>
                           ))}
@@ -653,7 +667,7 @@ Details: ${error.details || 'N/A'}
                     {m.attachments && m.attachments.length > 0 && (
                       <div className="space-y-2 border-t border-slate-100 pt-3">
                         <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                          Attached Image Processing
+                          {t('attachedImageProcessing')}
                         </div>
                         {m.attachments.map((att, i) => (
                           <div
@@ -661,7 +675,7 @@ Details: ${error.details || 'N/A'}
                             className="p-3 rounded bg-slate-50 border border-slate-200 text-xs space-y-1.5"
                           >
                             <div className="flex items-center justify-between gap-2">
-                              <span className="font-bold text-slate-900 truncate">{att.fileName}</span>
+                              <span className="font-bold text-slate-900 truncate" dir="ltr">{att.fileName}</span>
                               <span
                                 className={`font-bold uppercase px-2 py-0.5 rounded text-[10px] shrink-0 ${
                                   att.processingStatus === 'SUCCESS'
@@ -678,9 +692,9 @@ Details: ${error.details || 'N/A'}
                             {att.ocrText && (
                               <details className="text-[11px]">
                                 <summary className="font-bold text-slate-700 cursor-pointer">
-                                  OCR Text ({att.ocrText.length} chars)
+                                  {t('ocrText', { n: att.ocrText.length })}
                                 </summary>
-                                <pre className="mt-1 p-2 bg-white border border-slate-100 rounded font-mono text-slate-700 whitespace-pre-wrap leading-relaxed max-h-40 overflow-y-auto">
+                                <pre className="mt-1 p-2 bg-white border border-slate-100 rounded font-mono text-slate-700 whitespace-pre-wrap leading-relaxed max-h-40 overflow-y-auto" dir="auto">
                                   {att.ocrText}
                                 </pre>
                               </details>
@@ -689,9 +703,9 @@ Details: ${error.details || 'N/A'}
                             {att.imageDescription && (
                               <details className="text-[11px]" open={att.ocrText ? false : true}>
                                 <summary className="font-bold text-slate-700 cursor-pointer">
-                                  Image Understanding
+                                  {t('imageUnderstanding')}
                                 </summary>
-                                <div className="mt-1 p-2 bg-white border border-slate-100 rounded text-slate-600 leading-relaxed">
+                                <div className="mt-1 p-2 bg-white border border-slate-100 rounded text-slate-600 leading-relaxed" dir="auto">
                                   {att.imageDescription}
                                 </div>
                               </details>
@@ -699,7 +713,7 @@ Details: ${error.details || 'N/A'}
 
                             {att.error && (
                               <div className="text-[11px] text-rose-700 bg-rose-50 border border-rose-200 rounded p-1.5">
-                                {att.error.phase === 'ocr' ? 'OCR' : 'Image Understanding'} failed:{' '}
+                                {att.error.phase === 'ocr' ? t('ocrFailed') : t('imageUnderstandingFailed')} {t('failed')}{' '}
                                 {att.error.message}
                               </div>
                             )}
@@ -717,7 +731,7 @@ Details: ${error.details || 'N/A'}
                           className="px-3 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded text-xs font-bold uppercase tracking-wider flex items-center gap-1.5 transition-colors cursor-pointer"
                         >
                           <FileCheck className="w-3.5 h-3.5" />
-                          <span>View Official Packet</span>
+                          <span>{t('viewOfficialPacket')}</span>
                         </button>
 
                         <button
@@ -729,7 +743,7 @@ Details: ${error.details || 'N/A'}
                           className="px-3 py-1.5 bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 rounded text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
                         >
                           <Printer className="w-3.5 h-3.5" />
-                          <span>Export PDF</span>
+                          <span>{t('exportPdf')}</span>
                         </button>
                       </div>
                     )}
@@ -742,12 +756,12 @@ Details: ${error.details || 'N/A'}
             {isLoading && (
               <div className="flex flex-col items-start max-w-3xl mx-auto">
                 <div className="text-[10px] uppercase font-bold text-slate-400 mb-1 px-1">
-                  PriorAuth Engine
+                  {t('engineLoading')}
                 </div>
                 <div className="bg-white border border-slate-200 rounded-lg p-4 text-xs text-slate-700 flex items-center gap-3 shadow-sm">
                   <div className="w-4 h-4 border-2 border-slate-400 border-t-slate-900 rounded-full animate-spin" />
                   <span className="font-semibold">
-                    Querying Supabase Policy Documents & Evaluating Grounded Criteria...
+                    {t('engineLoadingMsg')}
                   </span>
                 </div>
               </div>
@@ -764,8 +778,8 @@ Details: ${error.details || 'N/A'}
           {/* Dynamic Available Payer Tags */}
           {availablePayers.length > 0 && (
             <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 pr-1 shrink-0">
-                Payer Tags:
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 pe-1 shrink-0">
+                {t('payerTags')}
               </span>
               {availablePayers.map((payer) => {
                 const tag = `@${payer}`;
@@ -781,7 +795,7 @@ Details: ${error.details || 'N/A'}
                         : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200'
                     }`}
                   >
-                    {tag}
+                    <span dir="ltr">{tag}</span>
                   </button>
                 );
               })}
@@ -793,7 +807,7 @@ Details: ${error.details || 'N/A'}
             <div className="p-2 bg-slate-50 border border-slate-200 rounded flex items-center justify-between text-xs">
               <div className="flex items-center gap-2 text-slate-700 truncate font-mono">
                 <Paperclip className="w-3.5 h-3.5 text-slate-500" />
-                <span className="truncate">{attachedFile.name}</span>
+                <span className="truncate" dir="ltr">{attachedFile.name}</span>
               </div>
               <button
                 type="button"
@@ -820,12 +834,12 @@ Details: ${error.details || 'N/A'}
                     onClick={() =>
                       setAttachedImages((prev) => prev.filter((_, idx) => idx !== i))
                     }
-                    className="absolute -top-1.5 -right-1.5 p-0.5 bg-slate-900 text-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
-                    title={`Remove ${img.name}`}
+                    className="absolute -top-1.5 -end-1.5 p-0.5 bg-slate-900 text-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+                    title={t('removeImage')}
                   >
                     <X className="w-3 h-3" />
                   </button>
-                  <span className="absolute bottom-0 left-0 right-0 text-[9px] font-mono text-white bg-slate-900/70 px-1 truncate">
+                  <span className="absolute bottom-0 inset-x-0 text-[9px] font-mono text-white bg-slate-900/70 px-1 truncate" dir="ltr">
                     {img.name}
                   </span>
                 </div>
@@ -845,8 +859,8 @@ Details: ${error.details || 'N/A'}
                   handleSend();
                 }
               }}
-              placeholder="Enter patient clinical chart, exam findings, prior conservative treatments, and @PayerName..."
-              className="w-full p-3 text-xs text-slate-900 placeholder-slate-400 font-mono resize-none focus:outline-none"
+              placeholder={t('chatPlaceholder')}
+              className="w-full p-3 text-xs text-slate-900 placeholder-slate-400 resize-none focus:outline-none"
             />
 
             <div className="p-2 bg-slate-50 border-t border-slate-200 flex items-center justify-between">
@@ -865,7 +879,7 @@ Details: ${error.details || 'N/A'}
                   title="Attach clinical chart note or image"
                 >
                   <Paperclip className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Attach EHR File / Image</span>
+                  <span className="hidden sm:inline">{t('attachEhrFile')}</span>
                 </button>
               </div>
 
@@ -879,7 +893,7 @@ Details: ${error.details || 'N/A'}
                     : 'bg-slate-900 hover:bg-slate-800 text-white shadow-sm'
                 }`}
               >
-                <span>Verify Claim</span>
+                <span>{t('verifyClaim')}</span>
                 <Send className="w-3 h-3" />
               </button>
             </div>
