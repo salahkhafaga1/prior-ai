@@ -206,7 +206,9 @@ export async function POST(req: NextRequest) {
 
     // 3. Diagnostics: Query Available Payers from Supabase
     logDiagnostic('[RAG ENGINE LOG]', 'Fetching available payers dynamically from Supabase...');
+    const payerStart = Date.now();
     const payersResult = await fetchAvailablePayers();
+    logDiagnostic('[SUPABASE LOG]', `Payers query completed in ${Date.now() - payerStart}ms.`);
 
     if (payersResult.error) {
       logDiagnosticError('[SUPABASE LOG]', 'Failed to query payers from database', payersResult.error);
@@ -256,7 +258,9 @@ export async function POST(req: NextRequest) {
 
     // 5. Query Supabase for Grounding Policy Documents
     logDiagnostic('[SUPABASE LOG]', `Retrieving policy documents for "${detectedPayer}"...`);
+    const policyStart = Date.now();
     const policyResult = await searchPayerPolicies(detectedPayer);
+    logDiagnostic('[SUPABASE LOG]', `Policy search completed in ${Date.now() - policyStart}ms.`);
 
     if (policyResult.error) {
       logDiagnosticError('[SUPABASE LOG]', `Policy search failed for "${detectedPayer}"`, policyResult.error);
@@ -348,9 +352,16 @@ export async function POST(req: NextRequest) {
     }
 
     const attachments: ProcessedImageAttachment[] = [];
-    for (const img of imagesToProcess) {
-      const processed = await processClinicalImage(img);
-      attachments.push(processed);
+    const imgStart = Date.now();
+    if (imagesToProcess.length > 0) {
+      const processed = await Promise.all(
+        imagesToProcess.map((img) => processClinicalImage(img, { skipLocalFallback: true }))
+      );
+      attachments.push(...processed);
+      logDiagnostic(
+        '[RAG ENGINE LOG]',
+        `Processed ${processed.length} image(s) in ${Date.now() - imgStart}ms (parallel, no local OCR fallback).`
+      );
     }
 
     const attachmentBlocks = attachments.filter((a) => a.ocrText || a.imageDescription);

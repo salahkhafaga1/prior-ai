@@ -265,7 +265,11 @@ export async function generateImageCaption(input: {
  * Process a single attached clinical image: OCR + image understanding.
  * Each stage fails independently and gracefully; never throws.
  */
-export async function processClinicalImage(input: ImageAttachmentRequest): Promise<ProcessedImageAttachment> {
+export async function processClinicalImage(
+  input: ImageAttachmentRequest,
+  options?: { skipLocalFallback?: boolean }
+): Promise<ProcessedImageAttachment> {
+  const skipLocalFallback = options?.skipLocalFallback ?? false;
   const mimeType = normalizeImageMimeType(input.mimeType);
   const fileName = input.fileName || 'image';
 
@@ -317,37 +321,43 @@ export async function processClinicalImage(input: ImageAttachmentRequest): Promi
     return result;
   }
 
-  // A. OCR pipeline (Gemini Vision first, local Tesseract as fallback)
-  let ocrText = '';
-  let ocrError: unknown = null;
-
-  try {
-    if (input.sizeBytes && input.sizeBytes > GEMINI_IMAGE_MAX_BYTES) {
-      throw new Error(`Image exceeds ${GEMINI_IMAGE_MAX_BYTES / (1024 * 1024)}MB Gemini OCR limit; using local OCR.`);
+  const runOcrStage = async (): Promise<{ text: string; error: unknown }> => {
+    let text = '';
+    let err: unknown = null;
+    try {
+      if (input.sizeBytes && input.sizeBytes > GEMINI_IMAGE_MAX_BYTES) {
+        throw new Error(`Image exceeds ${GEMINI_IMAGE_MAX_BYTES / (1024 * 1024)}MB Gemini OCR limit; using local OCR.`);
+      }
+      text = await extractTextWithGemini({ mimeType, base64: input.data });
+    } catch (geminiErr) {
+      err = geminiErr;
+      logDiagnosticError('[IMAGE LOG]', 'Gemini OCR failed', geminiErr);
     }
-    ocrText = await extractTextWithGemini({ mimeType, base64: input.data });
-  } catch (geminiErr) {
-    ocrError = geminiErr;
-    logDiagnosticError('[IMAGE LOG]', 'Gemini OCR failed; falling back to Tesseract', geminiErr);
-  }
 
-  if (!ocrText.trim()) {
-    if (detectedFormat === 'webp') {
-      // Tesseract.js decoding of WebP is unreliable; skip OCR to avoid a worker crash.
-      result.ocrStatus = 'OCR_FAILED';
-      result.error = {
-        phase: 'ocr',
-        message: ocrError instanceof Error ? ocrError.message : 'WebP images are not supported by the local OCR engine; image understanding was attempted instead.',
-      };
-    } else {
+    if (!text.trim() && !skipLocalFallback && detectedFormat !== 'webp') {
       try {
-        const text = await runLocalTesseractOCR(buffer);
-        ocrText = text.trim();
-      } catch (err) {
-        ocrError = err;
+        const t = await runLocalTesseractOCR(buffer);
+        text = t.trim();
+      } catch (tessErr) {
+        err = tessErr;
       }
     }
-  }
+    return { text, error: err };
+  };
+
+  const runCaptionStage = async (): Promise<{ caption: ImageCaption | null; error: unknown }> => {
+    try {
+      const caption = await generateImageCaption({ mimeType, base64: input.data });
+      return { caption, error: null };
+    } catch (captionErr) {
+      return { caption: null, error: captionErr };
+    }
+  };
+
+  const [ocrOut, captionOut] = await Promise.all([runOcrStage(), runCaptionStage()]);
+
+  const ocrText = ocrOut.text;
+  const ocrError = ocrOut.error;
 
   if (ocrText.trim().length >= OCR_MIN_TEXT_LENGTH) {
     result.ocrText = ocrText.trim();
@@ -360,23 +370,28 @@ export async function processClinicalImage(input: ImageAttachmentRequest): Promi
     if (!result.error) {
       result.error = {
         phase: 'ocr',
-        message: ocrError instanceof Error ? ocrError.message : 'No readable text detected in image.',
+        message:
+          detectedFormat === 'webp'
+            ? ocrError instanceof Error
+              ? ocrError.message
+              : 'WebP images are not supported by the local OCR engine; image understanding was attempted instead.'
+            : ocrError instanceof Error
+              ? ocrError.message
+              : 'No readable text detected in image.',
       };
     }
   }
 
-  // B. Image understanding pipeline (Gemini vision)
-  try {
-    const caption = await generateImageCaption({ mimeType, base64: input.data });
-    result.caption = caption;
-    result.imageDescription = renderCaption(caption);
+  if (captionOut.caption) {
+    result.caption = captionOut.caption;
+    result.imageDescription = renderCaption(captionOut.caption);
     result.captionStatus = 'CAPTION_SUCCESS';
-  } catch (err) {
+  } else {
     result.captionStatus = 'CAPTION_FAILED';
     if (!result.error) {
       result.error = {
         phase: 'caption',
-        message: err instanceof Error ? err.message : 'Image understanding failed.',
+        message: captionOut.error instanceof Error ? captionOut.error.message : 'Image understanding failed.',
       };
     }
   }
