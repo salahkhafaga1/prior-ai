@@ -145,11 +145,14 @@ export const PolicySidebar: React.FC<PolicySidebarProps> = ({
         body: formData,
       });
 
-      const data = await parseJsonResponse<{ success?: boolean; error?: string; message?: string; payer?: string }>(res);
+      const data = await parseJsonResponse<{ success?: boolean; error?: string; message?: string; payer?: string; ocrError?: string; ocrChars?: number }>(res);
 
       if (!res.ok || data.success === false) {
         console.error('[UPLOAD LOG] Upload rejected:', data);
-        setErrorMessage(data.error || data.message || `[Upload Error] Server returned HTTP ${res.status}`);
+        const detail = data.ocrError
+          ? `${data.error || data.message || `[Upload Error] Server returned HTTP ${res.status}`} (OCR: ${data.ocrError}${data.ocrChars !== undefined ? `, chars: ${data.ocrChars}` : ''})`
+          : data.error || data.message || `[Upload Error] Server returned HTTP ${res.status}`;
+        setErrorMessage(detail);
         return;
       }
 
