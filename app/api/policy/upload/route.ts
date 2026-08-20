@@ -141,6 +141,38 @@ function extractLocalPDFText(buffer: Buffer): string {
 }
 
 /**
+ * Extract text using the pdfjs-dist reference engine (handles CID/ToUnicode
+ * encoded fonts such as Arabic, where the regex-based extractor yields nothing).
+ */
+async function extractPdfTextWithPdfjs(buffer: Buffer): Promise<string> {
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const loadingTask = pdfjs.getDocument({
+    data: new Uint8Array(buffer),
+    disableFontFace: true,
+    useSystemFonts: true,
+  });
+  const doc = await loadingTask.promise;
+  try {
+    const pages: string[] = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const content = await page.getTextContent();
+      const pageText = content.items
+        .map((item) => ('str' in item ? item.str : ''))
+        .join(' ');
+      pages.push(pageText.trim());
+    }
+    return pages
+      .join('\n')
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+      .replace(/[ \t]+/g, ' ')
+      .trim();
+  } finally {
+    await loadingTask.destroy();
+  }
+}
+
+/**
  * Validate that extracted text is legible and contains no raw %PDF stream headers.
  */
 function isCleanReadableText(text: string): boolean {
@@ -263,10 +295,28 @@ export async function POST(req: NextRequest) {
             logDiagnostic('[UPLOAD LOG]', `Fast native extraction succeeded (${nativeExtracted.length} clean characters).`);
             content = nativeExtracted;
           } else {
-            // Flat scanned PDF or unindexed image -> Gemini Vision OCR
-            logDiagnostic('[UPLOAD LOG]', 'Native extraction found no clean text. Attempting Gemini Vision OCR...');
+            let pdfjsText = '';
+            try {
+              const pdfjsStart = Date.now();
+              pdfjsText = await extractPdfTextWithPdfjs(buffer);
+              logDiagnostic(
+                '[UPLOAD LOG]',
+                `pdfjs text extraction produced ${pdfjsText.length} characters in ${Date.now() - pdfjsStart}ms.`
+              );
+            } catch (pdfjsErr: any) {
+              logDiagnosticError('[UPLOAD LOG]', 'pdfjs text extraction failed', pdfjsErr);
+            }
+
+            if (isCleanReadableText(pdfjsText)) {
+              logDiagnostic('[UPLOAD LOG]', 'pdfjs extracted clean text (Arabic/CID fonts decoded).');
+              content = pdfjsText;
+              ocrUsed = true;
+            } else {
+              // Scanned/unindexed PDF -> Gemini Vision OCR
+              logDiagnostic('[UPLOAD LOG]', 'Native and pdfjs extraction found no clean text. Attempting Gemini Vision OCR...');
             const pdfBase64 = buffer.toString('base64');
             let geminiText = '';
+            let ocrError: unknown = null;
             if (file.size <= 15 * 1024 * 1024) {
               try {
                 geminiText = await withTimeout(
@@ -275,6 +325,7 @@ export async function POST(req: NextRequest) {
                 );
                 logDiagnostic('[UPLOAD LOG]', `Gemini Vision OCR extracted ${geminiText.length} characters.`);
               } catch (geminiErr: any) {
+                ocrError = geminiErr;
                 logDiagnosticError('[UPLOAD LOG]', 'Gemini Vision OCR failed or timed out for PDF', geminiErr);
               }
             } else {
@@ -285,17 +336,20 @@ export async function POST(req: NextRequest) {
               content = geminiText;
               ocrUsed = true;
             } else {
-              logDiagnostic('[UPLOAD LOG]', 'Gemini OCR could not produce clean text for PDF.');
+              logDiagnostic('[UPLOAD LOG]', `Gemini OCR could not produce clean text for PDF. Raw length: ${geminiText.length}.`);
               return NextResponse.json(
                 {
                   success: false,
                   error:
                     '[OCR Engine] Could not extract legible text from this PDF. Please upload the policy as a .txt file or paste the text directly.',
+                  ocrError: ocrError instanceof Error ? ocrError.message : 'Gemini OCR returned no clean text',
+                  ocrChars: geminiText.length,
                 },
                 { status: 422 }
               );
             }
           }
+        }
         } else if (lowerName.endsWith('.png') || lowerName.endsWith('.jpg') || lowerName.endsWith('.jpeg')) {
           // Direct Image File -> Gemini Vision OCR first, local Tesseract as fallback
           logDiagnostic('[UPLOAD LOG]', `Image policy uploaded (${lowerName}). Running Gemini Vision OCR...`);
